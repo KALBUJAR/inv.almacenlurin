@@ -308,11 +308,14 @@ const ORDINALES_VUELTA = ["", "primera", "segunda", "tercera", "cuarta", "quinta
 function ordinalVuelta(n) { return ORDINALES_VUELTA[n] || (n + "ª"); }
 
 function idsComprometidos(lotes, items) {
-  // Ítems que ya pertenecen a alguna lista generada y aún no han sido finalizados
-  // (siguen pendientes o pre-guardados), para no volver a incluirlos en una lista nueva.
+  // Ítems de las listas de HOY que aún no se cuentan (pendientes o pre-guardados): no se pueden
+  // volver a incluir en otra lista. Los ítems de listas de días anteriores que no se contaron
+  // quedan libres automáticamente y vuelven a estar pendientes de conteo.
+  const hoy = hoyISO();
   const mapaItems = new Map(items.map((it) => [it.id, it]));
   const set = new Set();
   (lotes || []).forEach((lote) => {
+    if (lote.date !== hoy) return;
     (lote.ids || []).forEach((id) => {
       const it = mapaItems.get(id);
       if (it && (it.estado === "pendiente" || it.estado === "preguardado")) set.add(id);
@@ -343,7 +346,7 @@ function planificarLista(items, seleccion, size, idsExcluir) {
       itemsSub.forEach((it) => { pool.push(it); resetIds.add(it.id); });
     } else {
       vueltas[key] = sg.vuelta;
-      itemsSub.filter((it) => it.estado === "pendiente" && !excluir.has(it.id)).forEach((it) => pool.push(it));
+      itemsSub.filter((it) => (it.estado === "pendiente" || it.estado === "preguardado") && !excluir.has(it.id)).forEach((it) => pool.push(it));
     }
   });
   const peso = { A: 0, B: 1, C: 2 };
@@ -372,7 +375,7 @@ function calcularResumenFamiliasPendientes(items, idsExcluir) {
     sg.vuelta = Math.max(sg.vuelta, it.vuelta || 1);
     sg.valorizadoTotal += it.valorizado;
     sg.ABCtotal[it.clasificacion_abc] = (sg.ABCtotal[it.clasificacion_abc] || 0) + 1;
-    if (it.estado === "pendiente" && !excluir.has(it.id)) {
+    if ((it.estado === "pendiente" || it.estado === "preguardado") && !excluir.has(it.id)) {
       sg.pendientes += 1; sg.valorizado += it.valorizado;
       sg[it.clasificacion_abc] = (sg[it.clasificacion_abc] || 0) + 1;
     } else if (it.estado === "pendiente" || it.estado === "preguardado") {
@@ -428,7 +431,11 @@ function calcularStatsGlobales(items) {
   };
 }
 
-function hoyISO() { return new Date().toISOString().slice(0, 10); }
+function fechaLocalISO(d) {
+  const p2 = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate());
+}
+function hoyISO() { return fechaLocalISO(new Date()); }
 function soles(n) { return "S/ " + Number(n || 0).toLocaleString("es-PE", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function cantidadFmt(n) { return Number(n || 0).toLocaleString("es-PE", { maximumFractionDigits: 2 }); }
 function esc(s) {
@@ -501,6 +508,7 @@ const state = {
   gestionTab: "tablero", // tablero | generar | aprobacion | historico
   operarioTab: "conteo", // conteo | historial
   confirmGenerarLista: false,
+  confirmLiberarLote: null, // id de la lista cuyos ítems sin contar se van a liberar
   obsGuardadaKey: null, // registro del histórico cuya observación se acaba de guardar
   historicoBusqueda: "",
   historicoDesde: "",
@@ -601,7 +609,7 @@ async function paginarSupabase(rutaBase) {
   let todas = [];
   while (true) {
     const sep = rutaBase.includes("?") ? "&" : "?";
-    const res = await fetch(SUPABASE_URL + rutaBase + sep + "limit=" + TAMANO_PAGINA + "&offset=" + desde, {
+    const res = await fetch(SUPABASE_URL + rutaBase + sep + "order=id.asc&limit=" + TAMANO_PAGINA + "&offset=" + desde, {
       headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY },
     });
     if (!res.ok) return null;
@@ -719,6 +727,33 @@ async function persistLoteUnico(lote) {
         vueltas: lote.vueltas || {},
         updated_at: new Date().toISOString(),
       }]),
+    });
+    state.storageError = !res.ok;
+  } catch (e) { state.storageError = true; }
+}
+
+async function actualizarLoteExistente(lote) {
+  state.lotes = (state.lotes || []).map((l) => (l.id === lote.id ? lote : l));
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/lotes", {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify([{
+        id: lote.id, date: lote.date, ids: lote.ids, familias: lote.familias,
+        asignado_a: lote.asignadoA, generado_por: lote.generadoPor, generado_fecha: lote.generadoFecha,
+        vueltas: lote.vueltas || {}, updated_at: new Date().toISOString(),
+      }]),
+    });
+    state.storageError = !res.ok;
+  } catch (e) { state.storageError = true; }
+}
+
+async function eliminarLote(id) {
+  state.lotes = (state.lotes || []).filter((l) => l.id !== id);
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/lotes?id=eq." + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY },
     });
     state.storageError = !res.ok;
   } catch (e) { state.storageError = true; }
@@ -1113,6 +1148,7 @@ function renderGestion() {
   if (state.confirmReset) renderModalReset();
   if (state.confirmImport) renderModalImport();
   if (state.confirmGenerarLista) renderModalGenerarLista();
+  if (state.confirmLiberarLote) renderModalLiberarLote();
 }
 
 /* ---------------- TABLERO ---------------- */
@@ -1230,6 +1266,7 @@ function contenidoGenerarLista() {
         Object.values(lote.vueltas || {}).filter((v) => v > 1).filter((v, i, a) => a.indexOf(v) === i).map((v) => ' <span class="vuelta-chip">' + ordinalVuelta(v) + ' vuelta</span>').join('') +
         (lote.familias && lote.familias.length ? (' · Familias: ' + esc(lote.familias.join(", "))) : "") +
         '<br>' + lote.ids.length + ' ítems en total, ' + (lote.ids.length - pendientesLote) + ' contados, ' + pendientesLote + ' pendientes.' +
+        (pendientesLote > 0 ? ' <button class="aprob-link" data-action="pedir-liberar-lote" data-id="' + esc(lote.id) + '">Liberar los ' + pendientesLote + ' sin contar</button>' : '') +
         '</div>';
     });
   }
@@ -1285,6 +1322,23 @@ function contenidoGenerarLista() {
     '</div></div>';
 
   return html;
+}
+
+function renderModalLiberarLote() {
+  const lote = (state.lotes || []).find((l) => l.id === state.confirmLiberarLote);
+  if (!lote) { state.confirmLiberarLote = null; return; }
+  const sinContar = lote.ids.map((id) => state.items.find((i) => i.id === id)).filter((it) => it && (it.estado === "pendiente" || it.estado === "preguardado"));
+  const conBorrador = sinContar.filter((it) => it.estado === "preguardado").length;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const body = '<p>Se quitarán de esta lista los <strong>' + sinContar.length + '</strong> ítems que aún no se contaron y volverán a quedar <strong>pendientes de conteo</strong>, disponibles para generar una nueva lista.</p>' +
+    (conBorrador ? '<p style="color:#B9760A;">' + conBorrador + ' de ellos tienen un conteo pre-guardado (borrador) que se descartará.</p>' : '') +
+    '<p>Los ítems ya contados de la lista se conservan.</p>' +
+    '<div class="modal-actions"><button class="btn-ghost" data-action="cancelar-liberar-lote">Cancelar</button>' +
+    '<button class="btn-dark" data-action="confirmar-liberar-lote">Liberar ítems</button></div>';
+  overlay.innerHTML = '<div class="modal-box"><div class="modal-head"><h3>Liberar ítems sin contar</h3>' +
+    '<button class="modal-close" data-action="cancelar-liberar-lote">' + icon("x", 20) + '</button></div><div class="modal-body">' + body + '</div></div>';
+  root.appendChild(overlay);
 }
 
 function renderModalGenerarLista() {
@@ -1481,7 +1535,7 @@ function generarDashboardDiario() {
   const itemsHoy = [];
   state.items.forEach((it) => {
     (it.conteosPrevios || []).concat(it.conteo ? [it.conteo] : []).forEach((c) => {
-      if (c && c.fecha && c.fecha.slice(0, 10) === hoy) itemsHoy.push(Object.assign({}, it, { conteo: c }));
+      if (c && c.fecha && fechaLocalISO(new Date(c.fecha)) === hoy) itemsHoy.push(Object.assign({}, it, { conteo: c }));
     });
   });
   const totalHoy = itemsHoy.length;
@@ -1815,6 +1869,24 @@ root.addEventListener("click", async (e) => {
     };
     await persistLoteUnico(nuevoLote);
     state.confirmGenerarLista = null;
+    render();
+  } else if (action === "pedir-liberar-lote") {
+    state.confirmLiberarLote = el.getAttribute("data-id"); render();
+  } else if (action === "cancelar-liberar-lote") {
+    state.confirmLiberarLote = null; render();
+  } else if (action === "confirmar-liberar-lote") {
+    const lote = (state.lotes || []).find((l) => l.id === state.confirmLiberarLote);
+    state.confirmLiberarLote = null;
+    if (lote) {
+      const sinContar = lote.ids.map((id) => state.items.find((i) => i.id === id)).filter((it) => it && (it.estado === "pendiente" || it.estado === "preguardado"));
+      const liberar = new Set(sinContar.map((it) => it.id));
+      // los pre-guardados vuelven a pendiente (se descarta el borrador)
+      const aReiniciar = sinContar.filter((it) => it.estado === "preguardado").map((it) => Object.assign({}, it, { estado: "pendiente", conteoBorrador: null }));
+      if (aReiniciar.length) await persistItemsParcial(aReiniciar);
+      const quedan = lote.ids.filter((id) => !liberar.has(id));
+      if (quedan.length === 0) await eliminarLote(lote.id);
+      else await actualizarLoteExistente(Object.assign({}, lote, { ids: quedan }));
+    }
     render();
   } else if (action === "alternar-grupo") {
     const target = document.getElementById(el.getAttribute("data-target"));
